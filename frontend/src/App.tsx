@@ -535,13 +535,13 @@ function ComponentViewer({ component, value }: { component: string; value: any }
 }
 
 function OptionCard({
-  methodId,
-  methodName,
+  side,
+  method,
   component,
   value,
 }: {
-  methodId: string;
-  methodName: string;
+  side: "left" | "right";
+  method: { id: string; name: string; file: string };
   component: string;
   value: any;
 }) {
@@ -549,8 +549,10 @@ function OptionCard({
     <div className="card optionCard">
       <div className="optionHeader">
         <div>
-          <div className="optionTitle">Option {methodId}</div>
-          <div className="optionSub">{methodName}</div>
+          <div className="optionTitle">
+            {side === "left" ? "LEFT" : "RIGHT"} — Option {method.id}
+          </div>
+          <div className="optionSub">{method.name}</div>
         </div>
       </div>
 
@@ -560,6 +562,7 @@ function OptionCard({
     </div>
   );
 }
+
 
 // ------------------ ROUTED PAGES ------------------
 
@@ -1022,3 +1025,5 @@ function App() {
     </BrowserRouter>
   );
 }
+
+export default App;
