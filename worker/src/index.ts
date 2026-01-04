@@ -228,6 +228,10 @@ export default {
     const origin = req.headers.get("Origin") || "";
     const allowed = originAllowed(env, origin);
 
+    // For allowed origins, reuse the same CORS headers everywhere.
+    // (For disallowed origins, we intentionally do NOT emit CORS headers.)
+    const headers = cors(origin);
+
     if (req.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: allowed ? cors(origin) : {} });
     }
@@ -245,21 +249,21 @@ export default {
     if (path.endsWith("/api/start")) {
       const body = await req.json().catch(() => ({}));
       const code = String(body.code || "").trim();
-      if (!code) return new Response(JSON.stringify({ error: "Missing code" }), { status: 400, headers: cors(origin) });
+      if (!code) return new Response(JSON.stringify({ error: "Missing code" }), { status: 400, headers });
 
       const codeHash = await sha256Hex(code);
       const doc = await dbGetAccessCode(env, codeHash);
-      if (!doc) return new Response(JSON.stringify({ error: "Invalid code" }), { status: 403, headers: cors(origin) });
-      if (doc.active !== 1) return new Response(JSON.stringify({ error: "Code inactive" }), { status: 403, headers: cors(origin) });
+      if (!doc) return new Response(JSON.stringify({ error: "Invalid code" }), { status: 403, headers });
+      if (doc.active !== 1) return new Response(JSON.stringify({ error: "Code inactive" }), { status: 403, headers });
 
       if (doc.uses_remaining !== null && doc.uses_remaining <= 0) {
-        return new Response(JSON.stringify({ error: "Code has no remaining uses" }), { status: 403, headers: cors(origin) });
+        return new Response(JSON.stringify({ error: "Code has no remaining uses" }), { status: 403, headers });
       }
 
       if (doc.expires_at) {
         const expMs = Date.parse(doc.expires_at);
-        if (!Number.isFinite(expMs)) return new Response(JSON.stringify({ error: "Bad expires_at format in DB" }), { status: 500, headers: cors(origin) });
-        if (Date.now() > expMs) return new Response(JSON.stringify({ error: "Code expired" }), { status: 403, headers: cors(origin) });
+        if (!Number.isFinite(expMs)) return new Response(JSON.stringify({ error: "Bad expires_at format in DB" }), { status: 500, headers });
+        if (Date.now() > expMs) return new Response(JSON.stringify({ error: "Code expired" }), { status: 403, headers });
       }
 
       if (doc.uses_remaining !== null) await dbDecrementUsesRemaining(env, codeHash);
@@ -285,7 +289,7 @@ export default {
 
       let payload: any;
       try {
-        payload = await verifyToken(String(body.token), env.JWT_SECRET);
+        payload = await verifyToken(env, String(body.token));
       } catch {
         return new Response(JSON.stringify({ error: "Invalid token" }), { status: 401, headers });
       }
@@ -311,7 +315,7 @@ export default {
 
       let payload: any;
       try {
-        payload = await verifyToken(String(body.token), env.JWT_SECRET);
+        payload = await verifyToken(env, String(body.token));
       } catch {
         return new Response(JSON.stringify({ error: "Invalid token" }), { status: 401, headers });
       }
