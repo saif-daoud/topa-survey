@@ -1,0 +1,8 @@
+{
+  "name": "topa-firestore-worker-api-2",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "^4.54.0"
+  }
+}
