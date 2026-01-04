@@ -1016,9 +1016,9 @@ const hasEnoughMethods = validMethodIds.length >= 2;
         <div className="topbar">
           <div>
             <div className="title">TOPA Expert Survey</div>
-            <div className="sub">
+            {/* <div className="sub">
               Participant: <b>{participantId}</b>
-            </div>
+            </div> */}
           </div>
 
           <div className="topbarRight">
