@@ -9,7 +9,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Apply D1 migrations before deploying the worker
+      - name: Sanity check D1 access
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.54.0"
+          workingDirectory: worker
+          command: d1 list
+
       - name: Apply D1 migrations (remote)
         uses: cloudflare/wrangler-action@v3
         with:
@@ -17,7 +25,7 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "4.54.0"
           workingDirectory: worker
-          command: d1 migrations apply topa_expert_survey_db_repo2 --remote --json
+          command: d1 migrations apply topa_expert_survey_db_repo2 --remote
 
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v3
