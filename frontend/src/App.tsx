@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { BrowserRouter, Routes, Route, Navigate, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { BrowserRouter, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import "./App.css";
 
 type Manifest = {
@@ -35,7 +35,6 @@ When you’re ready, click <strong>Start</strong> to begin.
 
 </div>
 `;
-
 
 function nowUtc() {
   return new Date().toISOString();
@@ -119,7 +118,6 @@ function resolveTiePreferred(
   return rnd() < 0.5 ? "left" : "right";
 }
 
-// champion vs unseen challengers (simple tournament)
 function nextPair(pid: string, component: string, methodIds: string[], history: any[]) {
   if (!pid || methodIds.length < 2) return null;
 
@@ -148,7 +146,6 @@ function nextPair(pid: string, component: string, methodIds: string[], history: 
     );
     champion = resolved === "left" ? last.left_method_id : last.right_method_id;
   } else {
-    // fallback (shouldn't happen)
     champion = last.left_method_id;
   }
 
@@ -196,7 +193,7 @@ function bestMatchingKey(obj: any, desired: string): string | null {
 
     let score = 0;
     if (nk === target) score = 100;
-    else if (nkS === targetS) score = 95; // handles conversation_state vs Conversation_states
+    else if (nkS === targetS) score = 95;
     else if (nk.includes(target) || target.includes(nk)) score = 70;
     else if (nkS.includes(targetS) || targetS.includes(nkS)) score = 60;
 
@@ -223,7 +220,7 @@ function escapeHtml(s: string) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
+    .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#039;");
 }
 
@@ -243,10 +240,23 @@ function clipText(x: any, max = 500) {
   return x.length > max ? x.slice(0, max - 1) + "…" : x;
 }
 
-// ---------- viewers ----------
-
 function isPrimitive(v: any) {
   return v == null || typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+}
+
+function isEmptyValue(v: any): boolean {
+  if (v == null) return true;
+  if (typeof v === "string") return v.trim().length === 0;
+  if (Array.isArray(v)) {
+    if (v.length === 0) return true;
+    return v.every(isEmptyValue);
+  }
+  if (isRecord(v)) {
+    const keys = Object.keys(v);
+    if (keys.length === 0) return true;
+    return keys.every((k) => isEmptyValue((v as any)[k]));
+  }
+  return false;
 }
 
 function parseListString(s: string): string[] | null {
@@ -270,11 +280,9 @@ function parseListString(s: string): string[] | null {
 
 function NestedBullets({ value, depth = 0 }: { value: any; depth?: number }) {
   const MAX_DEPTH = 7;
-  const MAX_ITEMS = 80;
+  const MAX_ITEMS = 120;
 
-  if (depth > MAX_DEPTH) {
-    return <span className="note">…</span>;
-  }
+  if (depth > MAX_DEPTH) return <span className="note">…</span>;
 
   if (isPrimitive(value)) {
     const s = value == null ? "" : String(value);
@@ -324,48 +332,163 @@ function ValueView({ value }: { value: any }) {
   if (isPrimitive(value)) {
     const s = value == null ? "" : String(value);
     const parsed = typeof value === "string" ? parseListString(value) : null;
-
     if (parsed) {
       return (
         <ul className="bullets">
-          {parsed.slice(0, 120).map((t, i) => (
+          {parsed.slice(0, 200).map((t, i) => (
             <li key={i}>{t}</li>
           ))}
         </ul>
       );
     }
-
-    return <div className="text" dangerouslySetInnerHTML={{ __html: renderMiniMarkdown(String(clipText(s, 5000))) }} />;
+    return <div className="text" dangerouslySetInnerHTML={{ __html: renderMiniMarkdown(String(clipText(s, 7000))) }} />;
   }
 
   if (Array.isArray(value)) {
-    const arr = value;
-    if (arr.length === 0) return <div className="note">Empty list.</div>;
+    if (value.length === 0) return <div className="note">Empty list.</div>;
+    const primitive = value.every(isPrimitive);
+    if (primitive) return <NestedBullets value={value} />;
+    // If it's an array of objects, always render as a table for consistency
+    // (prevents left/right options from appearing in different formats).
+    if (value.every(isRecord)) return <TableView data={value} />;
 
-    const primitive = arr.every(isPrimitive);
-    if (primitive) return <NestedBullets value={arr} />;
-
-    // For smaller lists of objects, bullets are more readable than a wide table
-    if (arr.length <= 12) {
+    // Otherwise keep a compact list view for short mixed arrays.
+    if (value.length <= 12) {
       return (
         <ul className="bullets">
-          {arr.map((it, i) => (
-            <li key={i}>
-              {isRecord(it) ? <KeyValueView data={it} /> : <NestedBullets value={it} />}
-            </li>
+          {value.map((it, i) => (
+            <li key={i}>{isRecord(it) ? <KeyValueView data={it} /> : <NestedBullets value={it} />}</li>
           ))}
         </ul>
       );
     }
-
-    return <TableView data={arr} />;
+    return <TableView data={value} />;
   }
 
-  if (isRecord(value)) {
-    return <KeyValueView data={value} />;
-  }
+  if (isRecord(value)) return <KeyValueView data={value} />;
 
   return <pre className="pre">{JSON.stringify(value, null, 2)}</pre>;
+}
+
+function TableView({ data }: { data: any }) {
+  const rows = Array.isArray(data) ? data : [];
+  if (rows.length === 0) return <div className="note">No rows.</div>;
+
+  if (rows.every(isPrimitive)) return <NestedBullets value={rows} />;
+
+  const MAX_ROWS = 220;
+  const shown = rows.slice(0, MAX_ROWS);
+
+  const cols: string[] = [];
+  for (const r of shown.slice(0, 80)) {
+    if (isRecord(r)) for (const k of Object.keys(r)) if (!cols.includes(k)) cols.push(k);
+  }
+  const finalCols = cols.length ? cols : ["value"];
+
+  return (
+    <div className="tableWrap">
+      {rows.length > MAX_ROWS && (
+        <div className="note">
+          Showing first <b>{MAX_ROWS}</b> rows out of <b>{rows.length}</b>.
+        </div>
+      )}
+      <table className="table">
+        <thead>
+          <tr>
+            {finalCols.map((c) => (
+              <th key={c}>{prettify(c)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {shown.map((r: any, i: number) => (
+            <tr key={i}>
+              {finalCols.map((c) => {
+                const v = isRecord(r) ? r[c] : c === "value" ? r : undefined;
+                const cell =
+                  typeof v === "string" || typeof v === "number" || typeof v === "boolean" || v == null
+                    ? String(clipText(v ?? "", 600))
+                    : JSON.stringify(v);
+                return <td key={c}>{cell}</td>;
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function KeyValueView({ data }: { data: any }) {
+  if (!isRecord(data)) return <div className="note">Unexpected format.</div>;
+  const entries = Object.entries(data);
+  return (
+    <div className="kv">
+      {entries.map(([k, v]) => (
+        <div key={k} className="kvRow">
+          <div className="kvKey">{prettify(k)}</div>
+          <div className="kvVal">
+            <ValueView value={v} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------- specialized viewers ----------
+function normalizeForTableRow(x: any): Record<string, any> {
+  if (!isRecord(x)) return { value: String(clipText(x ?? "", 1200)) };
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(x)) {
+    if (Array.isArray(v)) out[k] = v.map((z) => String(z)).join(", ");
+    else if (isRecord(v)) out[k] = JSON.stringify(v);
+    else out[k] = v;
+  }
+  return out;
+}
+
+function ConversationStateView({ data }: { data: any }) {
+  let arr: any[] | null = null;
+
+  if (Array.isArray(data)) arr = data;
+  else if (isRecord(data)) {
+    const candidates = ["states", "variables", "dimensions", "items", "conversation_states", "conversation_state"];
+    for (const c of candidates) {
+      const k = bestMatchingKey(data, c);
+      if (k && Array.isArray((data as any)[k])) {
+        arr = (data as any)[k];
+        break;
+      }
+    }
+    if (!arr) {
+      const arrKeys = Object.keys(data).filter((k) => Array.isArray((data as any)[k]));
+      if (arrKeys.length === 1) arr = (data as any)[arrKeys[0]];
+    }
+  }
+
+  if (!arr) return <ValueView value={data} />;
+  const rows = arr.map(normalizeForTableRow);
+  return <TableView data={rows} />;
+}
+
+function removeConfidence(x: any): any {
+  if (Array.isArray(x)) return x.map(removeConfidence);
+  if (isRecord(x)) {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(x)) {
+      const nk = normKey(k);
+      if (nk.includes("confidence")) continue;
+      out[k] = removeConfidence(v);
+    }
+    return out;
+  }
+  return x;
+}
+
+function CautionsView({ data }: { data: any }) {
+  const cleaned = removeConfidence(data);
+  return <ValueView value={cleaned} />;
 }
 
 function ActionSpaceView({ data }: { data: any }) {
@@ -381,11 +504,49 @@ function ActionSpaceView({ data }: { data: any }) {
         </div>
       )}
 
-      {shown.map((m, idx) => {
-        const name = m?.name ?? `Macro ${idx + 1}`;
-        const goal = m?.goal ?? m?.objective ?? null;
-        const desc = m?.description ?? m?.desc ?? null;
-        const micro = Array.isArray(m?.micro_actions) ? m.micro_actions : [];
+      {shown.map((m: any, idx: number) => {
+        const name = m?.name ?? m?.macro_action ?? `Macro ${idx + 1}`;
+        const goal = m?.goal ?? m?.objective ?? m?.intent ?? null;
+        const desc = m?.description ?? m?.definition ?? null;
+
+        const micro = Array.isArray(m?.micro_actions)
+          ? m.micro_actions
+          : Array.isArray(m?.microActions)
+          ? m.microActions
+          : [];
+
+        const states =
+          m?.states ?? m?.state ?? m?.conversation_states ?? m?.conversation_state ?? m?.conversationStates ?? null;
+
+        // show extra fields (so list fields aren't silently dropped)
+        const extra: Record<string, any> = {};
+        if (isRecord(m)) {
+          for (const [k, v] of Object.entries(m)) {
+            // Drop any confidence fields everywhere (macro-level)
+            if (normKey(k).includes("confidence")) continue;
+            if (
+              [
+                "name",
+                "macro_action",
+                "goal",
+                "objective",
+                "intent",
+                "description",
+                "definition",
+                "micro_actions",
+                "microActions",
+                "states",
+                "state",
+                "conversation_states",
+                "conversation_state",
+                "conversationStates",
+              ].includes(k)
+            )
+              continue;
+            if (isEmptyValue(v)) continue;
+            extra[k] = v;
+          }
+        }
 
         const goalSummary =
           goal == null
@@ -396,17 +557,17 @@ function ActionSpaceView({ data }: { data: any }) {
 
         return (
           <details key={idx} className="accordion">
-            <summary>
-              <div className="accTitle">{name}</div>
+            <summary className="accordionSummary">
+              <div className="accTitle">{clipText(name, 220)}</div>
               {goal || desc ? (
-                <div className="accMeta">{clipText(goalSummary || String(desc || ""), 200)}</div>
+                <div className="accMeta">{clipText(goalSummary || String(desc || ""), 220)}</div>
               ) : (
                 <div className="accMeta">Click to expand micro actions</div>
               )}
             </summary>
 
             <div className="accordionBody">
-              {(goal || desc) && (
+              {(goal || desc || states || Object.keys(extra).length > 0) && (
                 <div className="stack">
                   {goal && (
                     <div>
@@ -418,10 +579,25 @@ function ActionSpaceView({ data }: { data: any }) {
                       )}
                     </div>
                   )}
+
                   {desc && (
                     <div>
                       <div className="label">Description</div>
                       <div className="text" dangerouslySetInnerHTML={{ __html: renderMiniMarkdown(String(clipText(desc, 8000))) }} />
+                    </div>
+                  )}
+
+                  {!isEmptyValue(states) && (
+                    <div>
+                      <div className="label">States</div>
+                      <ValueView value={states} />
+                    </div>
+                  )}
+
+                  {Object.keys(extra).length > 0 && (
+                    <div>
+                      <div className="label">Other fields</div>
+                      <KeyValueView data={extra} />
                     </div>
                   )}
                 </div>
@@ -432,12 +608,29 @@ function ActionSpaceView({ data }: { data: any }) {
                 <div className="note">No micro actions.</div>
               ) : (
                 <ul className="bullets">
-                  {micro.slice(0, 220).map((mi: any, i: number) => (
-                    <li key={i}>
-                      <div className="microName">{mi?.name ?? `Micro ${i + 1}`}</div>
-                      {mi?.description && <div className="microDesc">{clipText(String(mi.description), 700)}</div>}
-                    </li>
-                  ))}
+                  {micro.slice(0, 220).map((mi: any, i: number) => {
+                    const miName = mi?.name ?? mi?.micro_action ?? `Micro ${i + 1}`;
+                    const miDesc = mi?.description ?? mi?.definition;
+
+                    const miExtras: Record<string, any> = {};
+                    if (isRecord(mi)) {
+                      for (const [k, v] of Object.entries(mi)) {
+                        // Drop any confidence fields everywhere (micro-level)
+                        if (normKey(k).includes("confidence")) continue;
+                        if (["name", "micro_action", "description", "definition"].includes(k)) continue;
+                        if (isEmptyValue(v)) continue;
+                        miExtras[k] = v;
+                      }
+                    }
+
+                    return (
+                      <li key={i}>
+                        <div className="microName">{clipText(miName, 220)}</div>
+                        {miDesc && <div className="microDesc">{clipText(String(miDesc), 1200)}</div>}
+                        {Object.keys(miExtras).length > 0 && <KeyValueView data={miExtras} />}
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
               {micro.length > 220 && (
@@ -453,85 +646,18 @@ function ActionSpaceView({ data }: { data: any }) {
   );
 }
 
-function TableView({ data }: { data: any }) {
-  const rows = Array.isArray(data) ? data : [];
-  if (rows.length === 0) return <div className="note">No rows.</div>;
-
-  // If it's a flat list, bullets are easier to read.
-  if (rows.every(isPrimitive)) {
-    return <NestedBullets value={rows} />;
-  }
-
-  const MAX_ROWS = 220;
-  const shown = rows.slice(0, MAX_ROWS);
-
-  // union keys (bounded)
-  const cols: string[] = [];
-  for (const r of shown.slice(0, 80)) {
-    if (isRecord(r)) {
-      for (const k of Object.keys(r)) if (!cols.includes(k)) cols.push(k);
-    }
-  }
-  const finalCols = cols.length ? cols : ["value"];
-
-  return (
-    <div className="tableWrap">
-      {rows.length > MAX_ROWS && (
-        <div className="note">
-          Showing first <b>{MAX_ROWS}</b> rows out of <b>{rows.length}</b>.
-        </div>
-      )}
-
-      <table className="table">
-        <thead>
-          <tr>
-            {finalCols.map((c) => (
-              <th key={c}>{prettify(c)}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {shown.map((r, i) => (
-            <tr key={i}>
-              {finalCols.map((c) => {
-                const v = isRecord(r) ? r[c] : c === "value" ? r : undefined;
-                const cell =
-                  typeof v === "string" || typeof v === "number" || typeof v === "boolean" || v == null
-                    ? String(clipText(v ?? "", 500))
-                    : JSON.stringify(v);
-                return <td key={c}>{cell}</td>;
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function KeyValueView({ data }: { data: any }) {
-  if (!isRecord(data)) return <div className="note">Unexpected format.</div>;
-  const entries = Object.entries(data);
-
-  return (
-    <div className="kv">
-      {entries.map(([k, v]) => (
-        <div key={k} className="kvRow">
-          <div className="kvKey">{prettify(k)}</div>
-          <div className="kvVal">
-            <ValueView value={v} />
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function ComponentViewer({ component, value }: { component: string; value: any }) {
-  if (component === "action_space") {
-    return <ActionSpaceView data={value} />;
-  }
-  return <ValueView value={value} />;
+  const nc = normKey(component);
+
+  // Globally remove confidence-related fields to avoid clutter
+  // (e.g., "Confidence score", "confidence_score") across all components.
+  const cleaned = removeConfidence(value);
+
+  if (nc === "actionspace") return <ActionSpaceView data={cleaned} />;
+  if (nc === "conversationstate" || nc === "conversationstates") return <ConversationStateView data={cleaned} />;
+  if (nc.includes("caution")) return <CautionsView data={cleaned} />;
+
+  return <ValueView value={cleaned} />;
 }
 
 function OptionCard({
@@ -549,9 +675,7 @@ function OptionCard({
     <div className="card optionCard">
       <div className="optionHeader">
         <div>
-          <div className="optionTitle">
-            {side === "left" ? "LEFT" : "RIGHT"} — Option {method.id}
-          </div>
+          <div className="optionTitle">{side === "left" ? "LEFT" : "RIGHT"} — Option {method.id}</div>
           <div className="optionSub">{method.name}</div>
         </div>
       </div>
@@ -562,7 +686,6 @@ function OptionCard({
     </div>
   );
 }
-
 
 // ------------------ ROUTED PAGES ------------------
 
@@ -590,7 +713,6 @@ function GatePage() {
     years_experience: "",
   });
 
-  // If already completed profile, go to /survey
   useEffect(() => {
     const t = localStorage.getItem("token");
     const p = localStorage.getItem("pid");
@@ -697,36 +819,11 @@ function GatePage() {
                   submitProfile();
                 }}
               >
-                <input
-                  className="input"
-                  placeholder="Full name"
-                  value={profile.name}
-                  onChange={(e) => setProfile((p) => ({ ...p, name: e.target.value }))}
-                />
-                <input
-                  className="input"
-                  placeholder="Email"
-                  value={profile.email}
-                  onChange={(e) => setProfile((p) => ({ ...p, email: e.target.value }))}
-                />
-                <input
-                  className="input"
-                  placeholder="Job title"
-                  value={profile.job_title}
-                  onChange={(e) => setProfile((p) => ({ ...p, job_title: e.target.value }))}
-                />
-                <input
-                  className="input"
-                  placeholder="Institution"
-                  value={profile.institution}
-                  onChange={(e) => setProfile((p) => ({ ...p, institution: e.target.value }))}
-                />
-                <input
-                  className="input"
-                  placeholder="Latest degree"
-                  value={profile.latest_degree}
-                  onChange={(e) => setProfile((p) => ({ ...p, latest_degree: e.target.value }))}
-                />
+                <input className="input" placeholder="Full name" value={profile.name} onChange={(e) => setProfile((p) => ({ ...p, name: e.target.value }))} />
+                <input className="input" placeholder="Email" value={profile.email} onChange={(e) => setProfile((p) => ({ ...p, email: e.target.value }))} />
+                <input className="input" placeholder="Job title" value={profile.job_title} onChange={(e) => setProfile((p) => ({ ...p, job_title: e.target.value }))} />
+                <input className="input" placeholder="Institution" value={profile.institution} onChange={(e) => setProfile((p) => ({ ...p, institution: e.target.value }))} />
+                <input className="input" placeholder="Latest degree" value={profile.latest_degree} onChange={(e) => setProfile((p) => ({ ...p, latest_degree: e.target.value }))} />
                 <input
                   className="input"
                   type="number"
@@ -750,8 +847,8 @@ function GatePage() {
                       localStorage.removeItem("token");
                       localStorage.removeItem("pid");
                       localStorage.removeItem("profile_done");
-                      localStorage.removeItem("votes");
-                      setToken("");
+                                            localStorage.removeItem("votes");
+setToken("");
                       setPid("");
                       setStep("code");
                       setStatus("Session cleared. Please enter your access code again.");
@@ -795,51 +892,58 @@ function SurveyPage() {
 
   useEffect(() => {
     const done = localStorage.getItem("profile_done") === "1";
-    if (!token || !participantId || !done) {
-      nav("/", { replace: true });
-    }
+    if (!token || !participantId || !done) nav("/", { replace: true });
   }, [token, participantId, nav]);
 
   useEffect(() => {
     (async () => {
-      const m: Manifest = await (await fetch(`${import.meta.env.BASE_URL}data/manifest.json`)).json();
+      const m: Manifest = await (await fetch(`${BASE_URL}data/manifest.json`)).json();
       setManifest(m);
 
-      const desc: Descriptions = await (await fetch(`${import.meta.env.BASE_URL}data/component_descriptions.json`))
-        .json()
-        .catch(() => ({}));
+      const desc: Descriptions = await (await fetch(`${BASE_URL}data/component_descriptions.json`)).json().catch(() => ({}));
       setDescriptions(desc);
 
       const loaded: Record<string, any> = {};
-      for (const method of m.methods) {
-        loaded[method.id] = await (await fetch(`${import.meta.env.BASE_URL}data/${method.file}`)).json();
-      }
+      for (const method of m.methods) loaded[method.id] = await (await fetch(`${BASE_URL}data/${method.file}`)).json();
       setMethods(loaded);
 
       setActiveComponent(m.components?.[0] || "");
     })().catch((e) => setStatus(`⚠️ Failed to load data: ${e.message}`));
   }, []);
 
+  
+const validMethodIds = useMemo(() => {
+  if (!manifest) return [];
+  // filter out methods where the current component is empty (so we don't compare empty vs non-empty)
+  return manifest.methods
+    .map((m) => m.id)
+    .filter((id) => {
+      const md = methods[id];
+      if (!md) return false;
+      const v = getComponentValue(md, activeComponent);
+      return !isEmptyValue(v);
+    });
+}, [manifest, methods, activeComponent]);
+
   if (!token || !participantId) return null;
 
   if (!manifest) {
-    return (
-      <div className="app">
-        <div className="container narrow">
-          <div className="card">
-            <div className="title">Loading…</div>
-            <div className="note">Fetching survey data.</div>
-            {status && <div className="status">{status}</div>}
-          </div>
+  return (
+    <div className="app">
+      <div className="container narrow">
+        <div className="card">
+          <div className="title">Loading…</div>
+          <div className="note">Fetching survey data.</div>
+          {status && <div className="status">{status}</div>}
         </div>
       </div>
-    );
-  }
+    </div>
+  );
+}
 
-  const methodIds = manifest.methods.map((m) => m.id);
-  const hasEnoughMethods = methodIds.length >= 2;
+const hasEnoughMethods = validMethodIds.length >= 2;
 
-  const pair = hasEnoughMethods && activeComponent ? nextPair(participantId, activeComponent, methodIds, history) : null;
+  const pair = hasEnoughMethods && activeComponent ? nextPair(participantId, activeComponent, validMethodIds, history) : null;
   const leftId = pair?.[0] ?? "";
   const rightId = pair?.[1] ?? "";
 
@@ -847,7 +951,7 @@ function SurveyPage() {
   const rightVal = rightId ? getComponentValue(methods[rightId], activeComponent) : null;
 
   const seen = history.filter((r) => r.participant_id === participantId && r.component === activeComponent).length;
-  const total = Math.max(0, methodIds.length - 1);
+  const total = Math.max(0, validMethodIds.length - 1);
 
   const isDone = hasEnoughMethods ? pair === null : false;
   const compDesc = getDescription(descriptions, activeComponent);
@@ -860,8 +964,7 @@ function SurveyPage() {
         .filter((r) => r.participant_id === participantId && r.component === activeComponent)
         .reduce((mx, r) => Math.max(mx, r.trial_id ?? 0), 0) + 1;
 
-    const resolved_preferred =
-      preferred === "tie" ? resolveTiePreferred(participantId, activeComponent, trialId, leftId, rightId) : preferred;
+    const resolved_preferred = preferred === "tie" ? resolveTiePreferred(participantId, activeComponent, trialId, leftId, rightId) : preferred;
 
     const voteObj: any = {
       participant_id: participantId,
@@ -916,10 +1019,23 @@ function SurveyPage() {
         <div className="topbar">
           <div>
             <div className="title">TOPA Expert Survey</div>
-            {/* <div className="sub">Participant: <b>{participantId}</b></div> */}
+            {/* <div className="sub">
+              Participant: <b>{participantId}</b>
+            </div> */}
           </div>
 
-          <div className="toolbar">
+          <div className="topbarRight">
+            <button className="btn" onClick={logout}>
+              Logout
+            </button>
+          </div>
+        </div>
+
+        {status && <div className="status">{status}</div>}
+
+        <div className="toolbar">
+          <div className="toolbarBlock">
+            <div className="label">Component</div>
             <select className="select" value={activeComponent} onChange={(e) => setActiveComponent(e.target.value)}>
               {manifest.components.map((c) => (
                 <option key={c} value={c}>
@@ -927,38 +1043,43 @@ function SurveyPage() {
                 </option>
               ))}
             </select>
+          </div>
 
+          <div className="toolbarBlock">
+            <div className="label">Progress</div>
             <div className="pill">
-              Progress: <b>{seen}</b> / <b>{total}</b>
+              {seen}/{total} comparisons
             </div>
+          </div>
 
-            <button className="btn" onClick={logout}>
-              Logout
-            </button>
+          <div className="toolbarBlock grow">
+            <div className="label">Description</div>
+            <div
+              className="descBox"
+              dangerouslySetInnerHTML={{
+                __html: compDesc ? renderMiniMarkdown(compDesc) : "<span class='note'>No description found for this component.</span>",
+              }}
+            />
           </div>
         </div>
 
-        <div className="card">
-          <div className="sectionTitle">Component description</div>
-          <div
-            className="descBox"
-            dangerouslySetInnerHTML={{
-              __html: compDesc
-                ? renderMiniMarkdown(compDesc)
-                : "<span class='note'>No description found for this component.</span>",
-            }}
-          />
-        </div>
+        {activeComponent === "action_space" && (
+          <div className="callout">
+            <div className="calloutBody">
+              <b>Tip:</b> In <b>Action Space</b>, click a <b>macro action</b> to expand and view its <b>micro actions</b>.
+            </div>
+          </div>
+        )}
 
         {!hasEnoughMethods && (
           <div className="card">
-            <div className="note">Not enough methods in manifest to run comparisons.</div>
+            <div className="note">Not enough methods with non-empty output for this component to run comparisons.</div>
           </div>
         )}
 
         {hasEnoughMethods && isDone && (
           <div className="card">
-            <div className="sectionTitle">Done 🎉</div>
+            <div className="titleSm">Done 🎉</div>
             <div className="note">
               You have completed all pairwise comparisons for <b>{prettify(activeComponent)}</b>.
             </div>
@@ -984,8 +1105,7 @@ function SurveyPage() {
 
             <div className="card voteCard">
               <div className="note">
-                Thank you for reading through the description details to make an informed judgement. If there is a clear
-                reason for preferring one method over the other, you can leave optional feedback below.
+                Thank you for reading through the description details to make an informed judgement. If there is a clear reason for preferring one method over the other, let's add a non-mandatory feedback field.
               </div>
 
               <textarea
@@ -1007,8 +1127,6 @@ function SurveyPage() {
                   Tie / No preference
                 </button>
               </div>
-
-              {status && <div className="status">{status}</div>}
             </div>
           </>
         )}
