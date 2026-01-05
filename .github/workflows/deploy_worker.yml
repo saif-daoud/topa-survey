@@ -14,7 +14,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           workingDirectory: worker
-          command: d1 migrations apply topa_expert_survey_db_repo2 --remote --yes
+          command: d1 migrations apply topa_expert_survey_db_repo2 --remote
 
       - uses: cloudflare/wrangler-action@v3
         with:
