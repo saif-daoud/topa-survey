@@ -916,7 +916,7 @@ function SurveyPage() {
         <div className="topbar">
           <div>
             <div className="title">TOPA Expert Survey</div>
-            <div className="sub">Participant: <b>{participantId}</b></div>
+            {/* <div className="sub">Participant: <b>{participantId}</b></div> */}
           </div>
 
           <div className="toolbar">
