@@ -112,7 +112,27 @@ async function allocateParticipantId(env: Env): Promise<string> {
 
   const n = Number(res?.meta?.last_row_id || 0);
   if (!Number.isFinite(n) || n <= 0) throw new Error("Failed to allocate participant id");
+  return formatParticipantId(n);
+}
+
+function formatParticipantId(n: number): string {
   return `P${String(n).padStart(5, "0")}`;
+}
+
+async function dbFindParticipantIdByEmail(env: Env, email: string): Promise<string | null> {
+  const norm = String(email || "").trim();
+  if (!norm) return null;
+
+  const row = await env.DB
+    .prepare(
+      "SELECT p.id AS id FROM participants p LEFT JOIN votes v ON v.participant_id = printf('P%05d', p.id) WHERE p.email IS NOT NULL AND TRIM(p.email) != '' AND lower(p.email) = lower(?) GROUP BY p.id ORDER BY COUNT(v.id) DESC, COALESCE(p.updated_at, p.created_at) DESC, p.id DESC LIMIT 1"
+    )
+    .bind(norm)
+    .first<{ id: number }>();
+
+  const idNum = Number(row?.id || 0);
+  if (!Number.isFinite(idNum) || idNum <= 0) return null;
+  return formatParticipantId(idNum);
 }
 
 function sanitizeText(v: any, maxLen: number): string {
@@ -294,8 +314,18 @@ export default {
         return new Response(JSON.stringify({ error: "Invalid token" }), { status: 401, headers });
       }
 
-      const participant_id = String(payload.participant_id || "");
-      if (!participant_id) return new Response(JSON.stringify({ error: "Invalid token payload" }), { status: 401, headers });
+      const current_participant_id = String(payload.participant_id || "");
+      const codeHash = String(payload.codeHash || "");
+      if (!current_participant_id || !codeHash) {
+        return new Response(JSON.stringify({ error: "Invalid token payload" }), { status: 401, headers });
+      }
+
+      // If this email already exists in the DB, reuse the original participant_id so the
+      // participant sees their previous progress when they re-enter with the same email.
+      const email = sanitizeText(body.profile?.email, 320);
+      const existing = await dbFindParticipantIdByEmail(env, email);
+
+      const participant_id = existing || current_participant_id;
 
       try {
         await dbUpdateParticipantProfile(env, participant_id, body.profile);
@@ -303,8 +333,55 @@ export default {
         return new Response(JSON.stringify({ error: e?.message || "Invalid profile" }), { status: 400, headers });
       }
 
-      return new Response(JSON.stringify({ ok: true }), { headers });
+      // If we switched participant_id, mint a fresh token bound to the reused participant_id.
+      let tokenOut = String(body.token);
+      const reused = participant_id !== current_participant_id;
+      if (reused) {
+        tokenOut = await makeToken(env, {
+          codeHash,
+          participant_id,
+          exp: Date.now() + 12 * 60 * 60 * 1000,
+        });
+      }
+
+      return new Response(JSON.stringify({ ok: true, participant_id, token: tokenOut, reused }), { headers });
     }
+
+
+    // POST /api/history
+    if (path.endsWith("/api/history")) {
+      const body: any = await req.json().catch(() => ({}));
+      if (!body?.token) {
+        return new Response(JSON.stringify({ error: "Missing token" }), { status: 400, headers });
+      }
+
+      let payload: any;
+      try {
+        payload = await verifyToken(env, String(body.token));
+      } catch {
+        return new Response(JSON.stringify({ error: "Invalid token" }), { status: 401, headers });
+      }
+
+      const participant_id = String(payload.participant_id || "");
+      if (!participant_id) return new Response(JSON.stringify({ error: "Invalid token payload" }), { status: 401, headers });
+
+      const rows = await env.DB
+        .prepare(
+          `SELECT
+             id, participant_id, component, trial_id,
+             left_method_id, right_method_id,
+             preferred, resolved_preferred, feedback,
+             timestamp_utc, user_agent, page_url, received_at
+           FROM votes
+           WHERE participant_id = ?
+           ORDER BY component ASC, trial_id ASC`
+        )
+        .bind(participant_id)
+        .all<VoteRow>();
+
+      return new Response(JSON.stringify({ ok: true, votes: rows?.results || [] }), { headers });
+    }
+
 
     // POST /api/vote
     if (path.endsWith("/api/vote")) {

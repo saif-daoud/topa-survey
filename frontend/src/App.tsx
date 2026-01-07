@@ -56,6 +56,40 @@ async function postJSON(url: string, payload: any) {
   return j;
 }
 
+
+// ---------- history helpers (merge local + server) ----------
+function historyKey(r: any) {
+  return `${r?.participant_id ?? ""}::${r?.component ?? ""}::${r?.trial_id ?? ""}`;
+}
+
+function mergeHistory(localRows: any[], remoteRows: any[]) {
+  const m = new Map<string, any>();
+
+  // Remote first (authoritative), then keep any local-only offline rows.
+  for (const r of remoteRows || []) m.set(historyKey(r), r);
+  for (const r of localRows || []) {
+    const k = historyKey(r);
+    if (!m.has(k)) m.set(k, r);
+  }
+
+  return Array.from(m.values()).sort((a, b) => {
+    const ca = String(a?.component ?? "");
+    const cb = String(b?.component ?? "");
+    if (ca < cb) return -1;
+    if (ca > cb) return 1;
+    return Number(a?.trial_id ?? 0) - Number(b?.trial_id ?? 0);
+  });
+}
+
+function makeVoteId(pid: string, component: string, trialId: number) {
+  const c = String(component || "")
+    .trim()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9_\-]/g, "");
+  return `${pid}__${c}__${trialId}`;
+}
+
+
 // ---------- small deterministic RNG for stable pairs ----------
 function hash32(s: string) {
   let h = 2166136261;
@@ -759,7 +793,7 @@ function GatePage() {
       setSubmitting(true);
       setStatus("Saving your details…");
 
-      await postJSON(`${API_BASE}/profile`, {
+      const res = await postJSON(`${API_BASE}/profile`, {
         token,
         profile: {
           name: profile.name.trim(),
@@ -771,9 +805,20 @@ function GatePage() {
         },
       });
 
+      // If the server detected this email already exists, it will return the
+      // original participant_id (and a new token bound to it).
+      if (res?.token && typeof res.token === "string") {
+        localStorage.setItem("token", res.token);
+        setToken(res.token);
+      }
+      if (res?.participant_id && typeof res.participant_id === "string") {
+        localStorage.setItem("pid", res.participant_id);
+        setPid(res.participant_id);
+      }
+
       localStorage.setItem("profile_done", "1");
-      setStatus("✅ Saved. Redirecting…");
-      nav("/survey", { replace: true });
+      setStatus(res?.reused ? "✅ Welcome back — your previous progress was restored. Redirecting…" : "✅ Saved. Redirecting…");
+nav("/survey", { replace: true });
     } catch (e: any) {
       setStatus(`❌ ${e.message}`);
     } finally {
@@ -896,6 +941,21 @@ function SurveyPage() {
     if (!token || !participantId || !done) nav("/", { replace: true });
   }, [token, participantId, nav]);
 
+  // Pull prior votes from the server so progress is restored even if localStorage is empty
+  // (e.g., new device, cleared browser data).
+  useEffect(() => {
+    if (!token || !participantId) return;
+    (async () => {
+      try {
+        const res = await postJSON(`${API_BASE}/history`, { token });
+        const remote = Array.isArray(res?.votes) ? res.votes : [];
+        if (remote.length) setHistory((prev) => mergeHistory(prev, remote));
+      } catch {
+        // ignore (offline, token expired, etc.)
+      }
+    })();
+  }, [token, participantId]);
+
   useEffect(() => {
     (async () => {
       const m: Manifest = await (await fetch(`${BASE_URL}data/manifest.json`)).json();
@@ -968,6 +1028,7 @@ const hasEnoughMethods = validMethodIds.length >= 2;
     const resolved_preferred = preferred === "tie" ? resolveTiePreferred(participantId, activeComponent, trialId, leftId, rightId) : preferred;
 
     const voteObj: any = {
+      id: makeVoteId(participantId, activeComponent, trialId),
       participant_id: participantId,
       component: activeComponent,
       trial_id: trialId,
