@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import "./App.css";
 
@@ -41,18 +41,49 @@ function nowUtc() {
   return new Date().toISOString();
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function postJSON(url: string, payload: any) {
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    // NOTE: keepalive is only used for vote posts (see SurveyPage).
   });
   const txt = await r.text();
   let j: any = null;
   try {
     j = JSON.parse(txt);
   } catch {}
-  if (!r.ok) throw new Error(j?.error || txt || `HTTP ${r.status}`);
+  if (!r.ok) {
+    const err: any = new Error(j?.error || txt || `HTTP ${r.status}`);
+    err.status = r.status;
+    err.body = j;
+    throw err;
+  }
+  return j;
+}
+
+async function postJSONKeepalive(url: string, payload: any) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    keepalive: true,
+  });
+  const txt = await r.text();
+  let j: any = null;
+  try {
+    j = JSON.parse(txt);
+  } catch {}
+  if (!r.ok) {
+    const err: any = new Error(j?.error || txt || `HTTP ${r.status}`);
+    err.status = r.status;
+    err.body = j;
+    throw err;
+  }
   return j;
 }
 
@@ -66,10 +97,14 @@ function mergeHistory(localRows: any[], remoteRows: any[]) {
   const m = new Map<string, any>();
 
   // Remote first (authoritative), then keep any local-only offline rows.
-  for (const r of remoteRows || []) m.set(historyKey(r), r);
+  for (const r of remoteRows || []) {
+    const rr = { ...r, synced: true, sync_error: null };
+    m.set(historyKey(rr), rr);
+  }
   for (const r of localRows || []) {
-    const k = historyKey(r);
-    if (!m.has(k)) m.set(k, r);
+    const lr = { ...r, synced: r?.synced === true ? true : false };
+    const k = historyKey(lr);
+    if (!m.has(k)) m.set(k, lr);
   }
 
   return Array.from(m.values()).sort((a, b) => {
@@ -920,6 +955,11 @@ function SurveyPage() {
   const [token, setToken] = useState(() => localStorage.getItem("token") || "");
   const [participantId, setParticipantId] = useState(() => localStorage.getItem("pid") || "");
 
+  const tokenRef = useRef(token);
+  useEffect(() => {
+    tokenRef.current = token;
+  }, [token]);
+
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [descriptions, setDescriptions] = useState<Descriptions>({});
   const [methods, setMethods] = useState<Record<string, any>>({});
@@ -927,12 +967,21 @@ function SurveyPage() {
 
   const [history, setHistory] = useState<any[]>(() => {
     const raw = localStorage.getItem("votes");
-    return raw ? JSON.parse(raw) : [];
+    try {
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.map((r) => ({ ...r, synced: r?.synced === true })) : [];
+    } catch {
+      return [];
+    }
   });
 
   const [submitting, setSubmitting] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [status, setStatus] = useState<string>("");
   const [feedback, setFeedback] = useState<string>("");
+
+  const [sessionExpired, setSessionExpired] = useState(false);
+  const [sessionExpiredMsg, setSessionExpiredMsg] = useState<string>("Your session has expired. Please refresh your access token to continue.");
 
   useEffect(() => localStorage.setItem("votes", JSON.stringify(history)), [history]);
 
@@ -941,20 +990,157 @@ function SurveyPage() {
     if (!token || !participantId || !done) nav("/", { replace: true });
   }, [token, participantId, nav]);
 
+  async function refreshSessionToken(): Promise<string> {
+    const cur = tokenRef.current;
+    if (!cur) throw new Error("Missing token");
+    const res = await postJSON(`${API_BASE}/refresh`, { token: cur }).catch((e: any) => {
+      const msg = e?.message || "Failed to refresh session";
+      const err: any = new Error(msg);
+      err.status = e?.status;
+      throw err;
+    });
+    if (!res?.token) throw new Error("Failed to refresh session");
+    localStorage.setItem("token", String(res.token));
+    setToken(String(res.token));
+    return String(res.token);
+  }
+
+  function flagSessionExpired(msg?: string) {
+    setSessionExpiredMsg(msg || "Your session has expired. Please refresh your access token to continue.");
+    setSessionExpired(true);
+  }
+
+  function markVoteSynced(voteId: string, synced: boolean, syncError?: string | null) {
+    setHistory((prev) =>
+      prev.map((r) =>
+        String(r?.id) === String(voteId)
+          ? {
+              ...r,
+              synced,
+              sync_error: syncError ?? null,
+              synced_at_utc: synced ? nowUtc() : r?.synced_at_utc ?? null,
+            }
+          : r
+      )
+    );
+  }
+
+  async function uploadVoteWithRetry(voteObj: any, maxAttempts = 4) {
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        await postJSONKeepalive(`${API_BASE}/vote`, { token: tokenRef.current, vote: voteObj });
+        return;
+      } catch (e: any) {
+        lastErr = e;
+
+        // If the token is expired, try to refresh once and retry immediately.
+        if (e?.status === 401) {
+          try {
+            await refreshSessionToken();
+            await postJSONKeepalive(`${API_BASE}/vote`, { token: tokenRef.current, vote: voteObj });
+            return;
+          } catch (e2: any) {
+            const msg = e2?.message || "Session expired";
+            flagSessionExpired(msg);
+            throw e2;
+          }
+        }
+
+        // Backoff for transient errors
+        const base = 450 * Math.pow(2, attempt);
+        const jitter = Math.floor(Math.random() * 180);
+        await sleep(base + jitter);
+      }
+    }
+    throw lastErr || new Error("Failed to upload vote");
+  }
+
+  async function syncPendingVotes(opts?: { reason?: string }) {
+    if (!tokenRef.current || !participantId) return;
+    if (syncing) return;
+
+    const reason = opts?.reason ? ` (${opts.reason})` : "";
+    setSyncing(true);
+    try {
+      // 1) Pull remote history (authoritative) and merge.
+      // If token expired, refresh and retry once.
+      let remote: any[] = [];
+      try {
+        const res = await postJSON(`${API_BASE}/history`, { token: tokenRef.current });
+        remote = Array.isArray(res?.votes) ? res.votes : [];
+      } catch (e: any) {
+        if (e?.status === 401) {
+          try {
+            await refreshSessionToken();
+            const res2 = await postJSON(`${API_BASE}/history`, { token: tokenRef.current });
+            remote = Array.isArray(res2?.votes) ? res2.votes : [];
+          } catch (e2: any) {
+            flagSessionExpired(e2?.message || "Session expired");
+            return;
+          }
+        }
+      }
+
+      if (remote.length) {
+        setHistory((prev) => mergeHistory(prev, remote));
+      }
+
+      // 2) Upload any local-only votes (sequentially).
+      const remoteIds = new Set<string>(remote.map((r: any) => String(r?.id || "")).filter(Boolean));
+      const localSnapshot = (() => {
+        try {
+          const raw = localStorage.getItem("votes");
+          const arr = raw ? JSON.parse(raw) : [];
+          return Array.isArray(arr) ? arr : [];
+        } catch {
+          return [];
+        }
+      })();
+
+      const pending = (Array.isArray(localSnapshot) ? localSnapshot : [])
+        .filter((r: any) => String(r?.participant_id || "") === String(participantId))
+        .map((r: any) => ({ ...r, synced: r?.synced === true }))
+        .filter((r: any) => r?.id && !remoteIds.has(String(r.id)) && r?.synced !== true)
+        .sort((a: any, b: any) => Number(a?.trial_id ?? 0) - Number(b?.trial_id ?? 0));
+
+      if (pending.length && opts?.reason === "manual") {
+        setStatus(`Syncing ${pending.length} pending vote(s)…${reason}`);
+      }
+
+      for (const v of pending) {
+        try {
+          await uploadVoteWithRetry(v);
+          markVoteSynced(String(v.id), true, null);
+        } catch (e: any) {
+          // Keep it pending; surface error on that row.
+          markVoteSynced(String(v.id), false, e?.message || "Upload failed");
+        }
+      }
+
+      if (pending.length && opts?.reason === "manual") {
+        setStatus("✅ Sync complete.");
+      }
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   // Pull prior votes from the server so progress is restored even if localStorage is empty
-  // (e.g., new device, cleared browser data).
+  // (e.g., new device, cleared browser data), then sync any pending local-only votes.
   useEffect(() => {
     if (!token || !participantId) return;
-    (async () => {
-      try {
-        const res = await postJSON(`${API_BASE}/history`, { token });
-        const remote = Array.isArray(res?.votes) ? res.votes : [];
-        if (remote.length) setHistory((prev) => mergeHistory(prev, remote));
-      } catch {
-        // ignore (offline, token expired, etc.)
-      }
-    })();
+    syncPendingVotes({ reason: "startup" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, participantId]);
+
+  // When the browser comes back online, attempt to sync pending votes.
+  useEffect(() => {
+    const onOnline = () => syncPendingVotes({ reason: "online" });
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [participantId]);
 
   useEffect(() => {
     (async () => {
@@ -1004,21 +1190,34 @@ const validMethodIds = useMemo(() => {
 
 const hasEnoughMethods = validMethodIds.length >= 2;
 
-  const pair = hasEnoughMethods && activeComponent ? nextPair(participantId, activeComponent, validMethodIds, history) : null;
+  // NOTE: do not use hooks below any early-return; keep these as plain derivations.
+  const syncedHistoryOnly = history.filter((r) => r?.synced === true);
+  const pair = hasEnoughMethods && activeComponent ? nextPair(participantId, activeComponent, validMethodIds, syncedHistoryOnly) : null;
   const leftId = pair?.[0] ?? "";
   const rightId = pair?.[1] ?? "";
 
   const leftVal = leftId ? getComponentValue(methods[leftId], activeComponent) : null;
   const rightVal = rightId ? getComponentValue(methods[rightId], activeComponent) : null;
 
-  const seen = history.filter((r) => r.participant_id === participantId && r.component === activeComponent).length;
+  const seenSaved = syncedHistoryOnly.filter((r) => r.participant_id === participantId && r.component === activeComponent).length;
+  const seenLocal = history.filter((r) => r.participant_id === participantId && r.component === activeComponent).length;
   const total = Math.max(0, validMethodIds.length - 1);
+
+  const pendingTotal = history.filter((r) => r.participant_id === participantId && r?.synced !== true).length;
+  const pendingCurrent = history.some((r) => r.participant_id === participantId && r.component === activeComponent && r?.synced !== true);
+  const pendingCurrentRow = (() => {
+    const rows = history
+      .filter((r) => r.participant_id === participantId && r.component === activeComponent && r?.synced !== true)
+      .sort((a, b) => Number(b?.trial_id ?? 0) - Number(a?.trial_id ?? 0));
+    return rows[0] || null;
+  })();
 
   const isDone = hasEnoughMethods ? pair === null : false;
   const compDesc = getDescription(descriptions, activeComponent);
 
   async function vote(preferred: "left" | "right" | "tie") {
     if (!pair || !token || !participantId) return;
+    if (pendingCurrent) return;
 
     const trialId =
       history
@@ -1040,6 +1239,8 @@ const hasEnoughMethods = validMethodIds.length >= 2;
       timestamp_utc: nowUtc(),
       user_agent: navigator.userAgent,
       page_url: window.location.href,
+      synced: false,
+      sync_error: null,
     };
 
     setHistory((prev) => [...prev, voteObj]);
@@ -1047,17 +1248,19 @@ const hasEnoughMethods = validMethodIds.length >= 2;
 
     try {
       setSubmitting(true);
-      setStatus("Submitting…");
-      await postJSON(`${API_BASE}/vote`, { token, vote: voteObj });
+      setStatus("Saving…");
+      await uploadVoteWithRetry(voteObj);
+      markVoteSynced(String(voteObj.id), true, null);
 
       if (preferred === "tie") {
         const kept = resolved_preferred === "left" ? leftId : rightId;
-        setStatus(`✅ Submitted. (Tie recorded — keeping ${kept} for subsequent comparisons.)`);
+        setStatus(`✅ Saved. (Tie recorded — keeping ${kept} for subsequent comparisons.)`);
       } else {
-        setStatus("✅ Submitted.");
+        setStatus("✅ Saved.");
       }
     } catch (e: any) {
-      setStatus(`⚠️ Submit failed (saved locally): ${e.message}`);
+      markVoteSynced(String(voteObj.id), false, e?.message || "Upload failed");
+      setStatus(`⚠️ Not saved to server yet: ${e?.message || "Upload failed"}`);
     } finally {
       setSubmitting(false);
     }
@@ -1078,6 +1281,51 @@ const hasEnoughMethods = validMethodIds.length >= 2;
   return (
     <div className="app">
       <div className="container">
+        {sessionExpired && (
+          <div className="modalOverlay" role="dialog" aria-modal="true">
+            <div className="modalCard">
+              <div className="titleSm">Session expired</div>
+              <div className="note" style={{ marginBottom: 10 }}>
+                {sessionExpiredMsg}
+              </div>
+              <div className="note" style={{ marginBottom: 12 }}>
+                You can refresh your token without losing locally saved votes.
+              </div>
+              <div className="formActions">
+                <button
+                  className="btn btnPrimary"
+                  onClick={async () => {
+                    try {
+                      setStatus("Refreshing session…");
+                      await refreshSessionToken();
+                      setSessionExpired(false);
+                      setStatus("✅ Session refreshed.");
+                      syncPendingVotes({ reason: "manual" });
+                    } catch (e: any) {
+                      setStatus(`❌ ${e?.message || "Failed to refresh"}`);
+                    }
+                  }}
+                >
+                  Refresh session
+                </button>
+                <button
+                  className="btn"
+                  onClick={() => {
+                    // Keep local votes, but require re-auth.
+                    localStorage.removeItem("token");
+                    localStorage.removeItem("profile_done");
+                    setToken("");
+                    setSessionExpired(false);
+                    nav("/", { replace: true });
+                  }}
+                >
+                  Re-enter access code
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="topbar">
           <div>
             <div className="title">TOPA Expert Survey</div>
@@ -1087,6 +1335,20 @@ const hasEnoughMethods = validMethodIds.length >= 2;
           </div>
 
           <div className="topbarRight">
+            <div className={`syncBadge ${pendingTotal === 0 ? "ok" : "warn"}`} title="Upload status">
+              {syncing ? (
+                <>Syncing… ({pendingTotal})</>
+              ) : pendingTotal === 0 ? (
+                <>Synced ✅</>
+              ) : (
+                <>Pending uploads: {pendingTotal} ⚠️</>
+              )}
+            </div>
+            {pendingTotal > 0 && (
+              <button className="btn" onClick={() => syncPendingVotes({ reason: "manual" })} disabled={syncing || submitting}>
+                Sync now
+              </button>
+            )}
             <button className="btn" onClick={logout}>
               Logout
             </button>
@@ -1110,8 +1372,13 @@ const hasEnoughMethods = validMethodIds.length >= 2;
           <div className="toolbarBlock">
             <div className="label">Progress</div>
             <div className="pill">
-              {seen}/{total} comparisons
+              Saved: {seenSaved}/{total}
             </div>
+            {seenLocal !== seenSaved && (
+              <div className="note" style={{ marginTop: 6 }}>
+                Local pending: {Math.max(0, seenLocal - seenSaved)}
+              </div>
+            )}
           </div>
 
           <div className="toolbarBlock grow">
@@ -1150,6 +1417,43 @@ const hasEnoughMethods = validMethodIds.length >= 2;
 
         {hasEnoughMethods && !isDone && (
           <>
+            {pendingCurrent && (
+              <div className="callout">
+                <div className="calloutTitle">Pending upload</div>
+                <div className="calloutBody">
+                  Your last choice is saved locally but not yet saved to the server.
+                  {pendingCurrentRow?.sync_error ? (
+                    <> Error: <b>{String(pendingCurrentRow.sync_error)}</b></>
+                  ) : (
+                    <> Please wait while we save, or click <b>Sync now</b>.</>
+                  )}
+                </div>
+                {pendingCurrentRow?.sync_error && (
+                  <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    <button className="btn btnPrimary" onClick={() => syncPendingVotes({ reason: "manual" })} disabled={syncing || submitting}>
+                      Retry upload
+                    </button>
+                    <button
+                      className="btn"
+                      onClick={() => {
+                        // Allow the expert to change their selection if it never reached the server.
+                        setHistory((prev) =>
+                          prev.filter(
+                            (r) =>
+                              !(r.participant_id === participantId && r.component === activeComponent && r?.synced !== true && String(r?.id) === String(pendingCurrentRow?.id))
+                          )
+                        );
+                        setStatus("Pending vote removed. You can vote again.");
+                      }}
+                      disabled={syncing || submitting}
+                    >
+                      Discard & re-vote
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="grid2">
               <OptionCard
                 side="left"
@@ -1179,13 +1483,13 @@ const hasEnoughMethods = validMethodIds.length >= 2;
               />
 
               <div className="voteBar">
-                <button className="btn btnPrimary" onClick={() => vote("left")} disabled={submitting}>
+                <button className="btn btnPrimary" onClick={() => vote("left")} disabled={submitting || syncing || pendingCurrent}>
                   Prefer LEFT
                 </button>
-                <button className="btn btnPrimary" onClick={() => vote("right")} disabled={submitting}>
+                <button className="btn btnPrimary" onClick={() => vote("right")} disabled={submitting || syncing || pendingCurrent}>
                   Prefer RIGHT
                 </button>
-                <button className="btn btnGhost" onClick={() => vote("tie")} disabled={submitting}>
+                <button className="btn btnGhost" onClick={() => vote("tie")} disabled={submitting || syncing || pendingCurrent}>
                   Tie / No preference
                 </button>
               </div>

@@ -6,6 +6,9 @@ export type Env = {
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
+// Token lifetime: keep it long enough for survey work, but still expiring eventually.
+const TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 function cors(origin: string) {
   return {
     ...JSON_HEADERS,
@@ -68,13 +71,13 @@ async function makeToken(env: Env, payload: any) {
   return `${body}.${sig}`;
 }
 
-async function verifyToken(env: Env, token: string) {
+async function verifyToken(env: Env, token: string, opts?: { ignoreExp?: boolean }) {
   const [body, sig] = token.split(".");
   if (!body || !sig) throw new Error("Bad token format");
   const expected = await hmacSign(env.TOKEN_SECRET, body);
   if (expected !== sig) throw new Error("Bad token signature");
   const payload = fromB64Json(body);
-  if (payload.exp && Date.now() > payload.exp) throw new Error("Token expired");
+  if (!opts?.ignoreExp && payload.exp && Date.now() > payload.exp) throw new Error("Token expired");
   return payload;
 }
 
@@ -292,7 +295,7 @@ export default {
       const token = await makeToken(env, {
         codeHash,
         participant_id,
-        exp: Date.now() + 12 * 60 * 60 * 1000,
+        exp: Date.now() + TOKEN_TTL_MS,
       });
 
       return new Response(JSON.stringify({ ok: true, token, participant_id }), { status: 200, headers: cors(origin) });
@@ -340,11 +343,39 @@ export default {
         tokenOut = await makeToken(env, {
           codeHash,
           participant_id,
-          exp: Date.now() + 12 * 60 * 60 * 1000,
+          exp: Date.now() + TOKEN_TTL_MS,
         });
       }
 
       return new Response(JSON.stringify({ ok: true, participant_id, token: tokenOut, reused }), { headers });
+    }
+
+
+    // POST /api/refresh
+    // Mint a new token for the same participant_id/codeHash.
+    // This does NOT consume access code uses and is safe even if the token is expired
+    // (as long as the signature is valid).
+    if (path.endsWith("/api/refresh")) {
+      const body: any = await req.json().catch(() => ({}));
+      if (!body?.token) {
+        return new Response(JSON.stringify({ error: "Missing token" }), { status: 400, headers });
+      }
+
+      let payload: any;
+      try {
+        payload = await verifyToken(env, String(body.token), { ignoreExp: true });
+      } catch {
+        return new Response(JSON.stringify({ error: "Invalid token" }), { status: 401, headers });
+      }
+
+      const participant_id = String(payload.participant_id || "");
+      const codeHash = String(payload.codeHash || "");
+      if (!participant_id || !codeHash) {
+        return new Response(JSON.stringify({ error: "Invalid token payload" }), { status: 401, headers });
+      }
+
+      const token = await makeToken(env, { codeHash, participant_id, exp: Date.now() + TOKEN_TTL_MS });
+      return new Response(JSON.stringify({ ok: true, participant_id, token }), { headers });
     }
 
 

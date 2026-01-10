@@ -472,3 +472,42 @@
   flex-wrap: wrap;
 }
 
+.syncBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.85);
+  color: var(--muted);
+  font-weight: 800;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.syncBadge.ok {
+  border-color: rgba(16, 185, 129, 0.35);
+}
+.syncBadge.warn {
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.modalOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  z-index: 9999;
+}
+
+.modalCard {
+  width: min(640px, 100%);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px;
+}
+
